@@ -5,15 +5,19 @@
   vars:
     Blocks:
         Setup: yes
-        Synchronize: yes
+        Synchronize: no
         Containers: yes
-        UpdateImages: yes
+        UpdateImages: no
         Commit: no
     ImageStorageDirectory: /root/dockerImages
     CommitPolicy:
         MinimumChangedBytes: 100000
         Force: yes
     Docker:
+        API:
+          Host: 127.0.0.1
+          Port: 19223
+          Socket: /var/run/docker.sock
         ImageTemplateServer: vpn201
         Containers:
           - name: centos
@@ -25,18 +29,32 @@
             privileged: yes
             volumes:
                 - /sys/fs/cgroup:/sys/fs/cgroup:ro
-            capabilities: []
+                - /dev/net:/dev/net:z
+                - /srv/service1:/var/lib/service1:Z
+            capabilities:
+               - net_admin
+            ports:
+               - "127.0.0.1:39552:22/tcp"
+               - "127.0.0.1:35993:9001/udp"
             Commands:
                 _Update: yum -y update
                 _Install: yum -y install
+                _Pip_Install: pip install --user --upgrade --force
+                _Npm_Install: npm i -g
                 _Remove: yum -y remove
                 _UsedBytes: "df / | tail -n1 | tr -s ' ' | cut -d' ' -f3"
-            Pips:
+            Npms:
                 Present:
                   - speed-test
-            NPMs:
+                  - xterm
+                  - js-beautify
+                  - nodemon
+                  - async
+                  - n
+            Pips:
                 Present:
                   - speedtest-cli
+                  - tcconfig
             Packages:
                 Update:
                   - '*'
@@ -45,6 +63,7 @@
                   - nmap
                   - httpd
                   - strace
+                  - htop
                   - nagios-plugins-ifstatus
                   - unzip
                   - autoconf
@@ -83,6 +102,7 @@
                   - tcpdump
                   - openvpn
                   - gcc
+                  - nmap-ncat
                   - bind-utils
                   - iostat
 
@@ -116,31 +136,37 @@
           pip: name={{item}} state=present
         - name: Starting and Enabling Docker
           service: name=docker state=started enabled=yes
+        - name: Configuring Docker to listen on TCP
+          notify: Restart Docker
+          lineinfile:
+            path: /etc/sysconfig/docker
+            regexp: "^OPTIONS="
+            line: "OPTIONS='--selinux-enabled --log-driver=journald --signature-verification=false -H tcp://{{Docker.API.Host}}:{{Docker.API.Port}} -H unix://{{Docker.API.Socket}}'"
+        - meta: flush_handlers
 
-
-  - name: Synchronize docker-images Tarballs
+  - name: Synchronize vpntech-docker-images Tarballs
     tags: images
     when: Blocks.Synchronize
     block:
-        - name: "Create Remote {{ImageStorageDirectory}}/docker-images directory"
-          file: path={{ImageStorageDirectory}}/docker-images state=directory
+        - name: "Create Remote {{ImageStorageDirectory}}/vpntech-docker-images directory"
+          file: path={{ImageStorageDirectory}}/vpntech-docker-images state=directory
         - name: debug files
           loop: "{{Docker.Images.keys()}}"
           debug: var=Docker.Images[item].archive
         - name: debug src files
           loop: "{{Docker.Images.keys()}}"
           debug:
-            msg: "../dockerImages/docker-images/{{Docker.Images[item].archive}}"
+            msg: "../dockerImages/vpntech-docker-images/{{Docker.Images[item].archive}}"
         - name: debug dest files
           loop: "{{Docker.Images.keys()}}"
           debug:
-            msg: "{{ImageStorageDirectory}}/docker-images/{{Docker.Images[item].archive}}"
+            msg: "{{ImageStorageDirectory}}/vpntech-docker-images/{{Docker.Images[item].archive}}"
         - name: Copy Image Tarballs
           loop: "{{Docker.Images.keys()}}"
           register: copiedTarballs
           copy: 
-            src: "../dockerImages/docker-images/{{Docker.Images[item].archive}}" 
-            dest: "{{ImageStorageDirectory}}/docker-images/"
+            src: "../dockerImages/vpntech-docker-images/{{Docker.Images[item].archive}}" 
+            dest: "{{ImageStorageDirectory}}/vpntech-docker-images/"
         - name: Import Docker Images
           loop: "{{Docker.Images.keys()}}"
           register: imageImports
@@ -148,7 +174,7 @@
           - Docker.Images[item].build
           docker_image:
              name: "{{item}}"
-             load_path: "{{ImageStorageDirectory}}/docker-images/{{Docker.Images[item].archive}}"
+             load_path: "{{ImageStorageDirectory}}/vpntech-docker-images/{{Docker.Images[item].archive}}"
              push: no
              buildargs:
                log_volume: /var/log/myapp
@@ -206,12 +232,51 @@
           set_fact:
             beforeBytes: "{{before_usedBytes.results[0].stdout|int}}"
 
+        - name: Add the newly created container to the inventory
+#          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          loop: "{{Docker.Containers}}"
+          add_host:
+              name: "{{ item.name }}"
+              ansible_connection: docker
+              ansible_user: root
+              #remote_addr: "{{item.name}}"
+              ansible_ssh_host: "{{Docker.Images[item.imageTarball].templateServer}}"
+              #ansible_python_interpreter: /usr/bin/python
+
+#        - name: Gather Docker Container Facts
+#          gather_facts: yes
+#          conn
+        - name: Debug Container Ifconfig
+          debug: var=hostvars['centos']
+        - name: test centos
+          run_once: yes
+          delegate_to: centos
+          command: ifconfig
+          register: i
+        - debug: var=i
+        - name: Run Command in Docker Container
+          loop: "{{Docker.Containers}}"
+          #connection: docker
+          delegate_to: "{{item.name}}"
+          #delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          #remote_host: "{{Docker.Images[item.imageTarball].templateServer}}"
+          #connection: docker
+          register: containerIfconfig
+          command: ifconfig
+#          delegate_to: "{{item.name}}"
+#          run_once: yes
+
+        - name: Debug Container Ifconfig
+          debug: var=containerIfconfig
+
+        - meta: end_play
+
         - name: "Updating Container Images :: Issue Container Image Update Commands"
           delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
           run_once: yes
           loop: "{{Docker.Containers}}"
           register: updateOutput
-          shell: "docker exec {{item.name}} bash -l -c \"{{item.Commands._Update}} {{item.Packages.Update|join(' ')}} && {{item.Commands._Install}} {{item.Packages.Present|join(' ')}} && {{item.Commands._Remove}} {{item.Packages.Absent|join(' ')}}\""
+          shell: "docker exec {{item.name}} bash -l -c \"{{item.Commands._Update}} {{item.Packages.Update|join(' ')}} && {{item.Commands._Install}} {{item.Packages.Present|join(' ')}} && {{item.Commands._Remove}} {{item.Packages.Absent|join(' ')}} && {{item.Commands._Pip_Install}} {{item.Pips.Present|join(' ')}} && {{item.Commands._Npm_Install}} {{item.Npms.Present|join(' ')}}\""
 
         - name: "Updating Container Images :: Collecting Container Used Bytes"
           delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
@@ -258,7 +323,7 @@
                   loop: "{{Docker.Containers}}"
                   docker_image:
                      name: "{{item.image}}:latest"
-                     archive_path: "{{ImageStorageDirectory}}/docker-images/{{Docker.Images[item.imageTarball].archive}}"
+                     archive_path: "{{ImageStorageDirectory}}/vpntech-docker-images/{{Docker.Images[item.imageTarball].archive}}"
                      push: no
                      repository: "{{item.image}}"
 
@@ -268,8 +333,8 @@
                   loop: "{{Docker.Containers}}"
                   fetch:
                     validate_checksum: no
-                    src: "{{ImageStorageDirectory}}/docker-images/{{Docker.Images[item.imageTarball].archive}}"
-                    dest: ../dockerImages/docker-images
+                    src: "{{ImageStorageDirectory}}/vpntech-docker-images/{{Docker.Images[item.imageTarball].archive}}"
+                    dest: ../dockerImages/vpntech-docker-images
                     flat: yes
 
                 - name: "Updating Container Images :: Push Docker Image Tarballs to Repo"
@@ -279,7 +344,7 @@
                   loop: "{{Docker.Containers}}"
                   shell: "git add {{Docker.Images[item.imageTarball].archive}}; git commit {{Docker.Images[item.imageTarball].archive}} -m 'automatic docker image update from playbook' && git status | grep 'directory clean' || git push"
                   args:
-                    chdir: ../dockerImages/docker-images 
+                    chdir: ../dockerImages/vpntech-docker-images 
         
 
            
@@ -295,19 +360,17 @@
               auto_remove: no
               cleanup: no
               detach: yes
+              hostname: "{{item.hostname}}"
               name: "{{item.name}}"
               image: "{{item.image}}"
               state: "{{item.state}}"
               volumes: "{{item.volumes}}"
               privileged: "{{item.privileged}}"
               capabilities: "{{item.capabilities}}"
-              hostname: "{{item.hostname}}"
+              ports: "{{item.ports}}"
               recreate: yes
               memory: 512M
               memory_swap: 1024M
               memory_reservation: 512M
-              ports:
-               - "35992:9000"
-               - "127.0.0.1:35993:9001/udp"
         - name: Debug testContainer
           debug: var=testContainer
