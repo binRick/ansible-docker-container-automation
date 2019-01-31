@@ -4,10 +4,10 @@
   gather_facts: yes
   vars:
     Blocks:
-        Setup: yes
+        Setup: no
         Synchronize: no
-        Containers: yes
-        UpdateImages: no
+        Containers: no
+        UpdateImages: yes
         Commit: no
     ImageStorageDirectory: /root/dockerImages
     CommitPolicy:
@@ -15,7 +15,7 @@
         Force: yes
     Docker:
         API:
-          Host: 127.0.0.1
+          Host: 0.0.0.0
           Port: 19223
           Socket: /var/run/docker.sock
         ImageTemplateServer: vpn201
@@ -131,18 +131,38 @@
         - name: Installing Docker Packages
           loop: [docker]
           yum: name={{item}} state=present
+        - name: Installing Docker Packages on localhost
+          run_once: yes
+          delegate_to: localhost
+          connection: local
+          become: yes
+          become_method: sudo
+          become_user: root
+          command: yum -y install docker
+          #warn: no
         - name: Installing Docker Python Packages
           loop: [docker]
           pip: name={{item}} state=present
+        - name: Installing Docker Packages on localhost
+          run_once: yes
+          delegate_to: localhost
+          connection: local
+          become: yes
+          become_method: sudo
+          become_user: root
+          command: pip install docker --user
+          #warn: no
         - name: Starting and Enabling Docker
           service: name=docker state=started enabled=yes
         - name: Configuring Docker to listen on TCP
-          notify: Restart Docker
+          register: dr
           lineinfile:
             path: /etc/sysconfig/docker
             regexp: "^OPTIONS="
             line: "OPTIONS='--selinux-enabled --log-driver=journald --signature-verification=false -H tcp://{{Docker.API.Host}}:{{Docker.API.Port}} -H unix://{{Docker.API.Socket}}'"
-        - meta: flush_handlers
+        - name: restart docker
+          when: dr is changed
+          systemd: name=docker state=restarted
 
   - name: Synchronize vpntech-docker-images Tarballs
     tags: images
@@ -239,35 +259,32 @@
               name: "{{ item.name }}"
               ansible_connection: docker
               ansible_user: root
+              ansible_docker_extra_args: "-H=tcp://{{Docker.Images[item.imageTarball].templateServer}}:{{Docker.API.Port}}"
               #remote_addr: "{{item.name}}"
-              ansible_ssh_host: "{{Docker.Images[item.imageTarball].templateServer}}"
+              #ansible_ssh_host: "{{Docker.Images[item.imageTarball].templateServer}}"
               #ansible_python_interpreter: /usr/bin/python
 
-#        - name: Gather Docker Container Facts
-#          gather_facts: yes
-#          conn
-        - name: Debug Container Ifconfig
+        - name: Gather Docker Container Facts
+          run_once: yes
+          delegate_to: centos
+          register: centosFacts
+          setup:
+
+        - name: Debug Container Host Facts
+          debug: var=centosFacts
+          run_once: yes
+
+        - name: Debug Container Host Vars
           debug: var=hostvars['centos']
-        - name: test centos
+          run_once: yes
+
+        - name: Run test command in Docker Container
           run_once: yes
           delegate_to: centos
           command: ifconfig
           register: i
-        - debug: var=i
-        - name: Run Command in Docker Container
-          loop: "{{Docker.Containers}}"
-          #connection: docker
-          delegate_to: "{{item.name}}"
-          #delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
-          #remote_host: "{{Docker.Images[item.imageTarball].templateServer}}"
-          #connection: docker
-          register: containerIfconfig
-          command: ifconfig
-#          delegate_to: "{{item.name}}"
-#          run_once: yes
 
-        - name: Debug Container Ifconfig
-          debug: var=containerIfconfig
+        - debug: var=i
 
         - meta: end_play
 
