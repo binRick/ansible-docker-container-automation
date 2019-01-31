@@ -1,0 +1,313 @@
+---
+- name: Setup VPN Client Node
+  hosts: vpnClientNodes
+  gather_facts: yes
+  vars:
+    Blocks:
+        Setup: yes
+        Synchronize: yes
+        Containers: yes
+        UpdateImages: yes
+        Commit: no
+    ImageStorageDirectory: /root/dockerImages
+    CommitPolicy:
+        MinimumChangedBytes: 100000
+        Force: yes
+    Docker:
+        ImageTemplateServer: vpn201
+        Containers:
+          - name: centos
+            imageTemplate: yes
+            image: centos/systemd
+            imageTarball: centos-systemd
+            state: started
+            hostname: centos-7-test
+            privileged: yes
+            volumes:
+                - /sys/fs/cgroup:/sys/fs/cgroup:ro
+            capabilities: []
+            Commands:
+                _Update: yum -y update
+                _Install: yum -y install
+                _Remove: yum -y remove
+                _UsedBytes: "df / | tail -n1 | tr -s ' ' | cut -d' ' -f3"
+            Pips:
+                Present:
+                  - speed-test
+            NPMs:
+                Present:
+                  - speedtest-cli
+            Packages:
+                Update:
+                  - '*'
+                Present:
+                  - epel-release
+                  - nmap
+                  - httpd
+                  - strace
+                  - nagios-plugins-ifstatus
+                  - unzip
+                  - autoconf
+                  - psmisc
+                  - curl-devel
+                  - iproute
+                  - iperf
+                  - lsof
+                  - tmux
+                  - iptraf-ng
+                  - unbound-libs
+                  - python-pip
+                  - yum-utils
+                  - zsh
+                  - socat
+                  - ppp
+                  - openconnect
+                  - vim-enhanced
+                  - xl2tpd
+                  - expect
+                  - mlocate
+                  - autoconf
+                  - libpcap
+                  - fping
+                  - ngrep
+                  - wget
+                  - curl
+                  - telnet
+                  - nload
+                  - openssl
+                  - net-tools
+                  - git
+                  - rsync
+                  - md5
+                  - python
+                  - tcpdump
+                  - openvpn
+                  - gcc
+                  - bind-utils
+                  - iostat
+
+
+                Absent:
+                  - adcli
+        Images:
+          centos-systemd:
+            archive: centos-systemd.tar
+            build: yes
+            update: yes
+            templateServer: vpn201
+            Commit: no
+
+
+  handlers:
+  - name: Restart SSHD
+    systemd: name=sshd state=restarted
+  - name: Restart Docker
+    systemd: name=docker state=restarted
+  tasks:
+  - name: Docker Setup
+    tags: setup
+    when: Blocks.Setup
+    block:
+        - name: Installing Docker Packages
+          loop: [docker]
+          yum: name={{item}} state=present
+        - name: Installing Docker Python Packages
+          loop: [docker]
+          pip: name={{item}} state=present
+        - name: Starting and Enabling Docker
+          service: name=docker state=started enabled=yes
+
+
+  - name: Synchronize docker-images Tarballs
+    tags: images
+    when: Blocks.Synchronize
+    block:
+        - name: "Create Remote {{ImageStorageDirectory}}/docker-images directory"
+          file: path={{ImageStorageDirectory}}/docker-images state=directory
+        - name: debug files
+          loop: "{{Docker.Images.keys()}}"
+          debug: var=Docker.Images[item].archive
+        - name: debug src files
+          loop: "{{Docker.Images.keys()}}"
+          debug:
+            msg: "../dockerImages/docker-images/{{Docker.Images[item].archive}}"
+        - name: debug dest files
+          loop: "{{Docker.Images.keys()}}"
+          debug:
+            msg: "{{ImageStorageDirectory}}/docker-images/{{Docker.Images[item].archive}}"
+        - name: Copy Image Tarballs
+          loop: "{{Docker.Images.keys()}}"
+          register: copiedTarballs
+          copy: 
+            src: "../dockerImages/docker-images/{{Docker.Images[item].archive}}" 
+            dest: "{{ImageStorageDirectory}}/docker-images/"
+        - name: Import Docker Images
+          loop: "{{Docker.Images.keys()}}"
+          register: imageImports
+          when: 
+          - Docker.Images[item].build
+          docker_image:
+             name: "{{item}}"
+             load_path: "{{ImageStorageDirectory}}/docker-images/{{Docker.Images[item].archive}}"
+             push: no
+             buildargs:
+               log_volume: /var/log/myapp
+               listen_port: 8080
+        - name: Pull Non existent Docker Images
+          loop: "{{imageImports.results}}"
+          debug: var=item
+
+
+  - name: Update CentOS Docker Container
+    when: Blocks.UpdateImages
+    block:
+        - name: "Updating Container Images :: Remove Image Containers"
+          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          run_once: yes
+          loop: "{{Docker.Containers}}"
+          docker_container:
+            name: "{{item.name}}"
+            state: absent
+            purge_networks: yes
+
+        - name: "Updating Container Images :: Create CentOS Container Images"
+          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          run_once: yes
+          loop: "{{Docker.Containers}}"
+          docker_container:
+            name: "{{item.name}}"
+            hostname: "{{item.hostname}}"
+            image: "{{item.image}}"
+            volumes: "{{item.volumes}}"
+            privileged: "{{item.privileged}}"
+            capabilities: "{{item.capabilities}}"
+            recreate: yes
+            detach: yes
+            state: started
+            pull: no
+            auto_remove: no
+            cleanup: no
+
+        - name: "Updating Container Images :: Pausing to let Containers start"
+          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          loop: "{{Docker.Containers}}"
+          run_once: yes
+          pause: seconds=2
+
+        - name: "Updating Container Images :: Collecting Container Used Bytes"
+          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          run_once: yes
+          loop: "{{Docker.Containers}}"
+          register: before_usedBytes
+          shell: "docker exec {{item.name}} bash -l -c \"{{item.Commands._UsedBytes}}\""
+
+        - name: Set beforeBytes
+          run_once: yes
+          set_fact:
+            beforeBytes: "{{before_usedBytes.results[0].stdout|int}}"
+
+        - name: "Updating Container Images :: Issue Container Image Update Commands"
+          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          run_once: yes
+          loop: "{{Docker.Containers}}"
+          register: updateOutput
+          shell: "docker exec {{item.name}} bash -l -c \"{{item.Commands._Update}} {{item.Packages.Update|join(' ')}} && {{item.Commands._Install}} {{item.Packages.Present|join(' ')}} && {{item.Commands._Remove}} {{item.Packages.Absent|join(' ')}}\""
+
+        - name: "Updating Container Images :: Collecting Container Used Bytes"
+          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          run_once: yes
+          loop: "{{Docker.Containers}}"
+          register: after_usedBytes
+          shell: "docker exec {{item.name}} bash -l -c \"{{item.Commands._UsedBytes}}\""
+
+        - name: Set afterBytes
+          run_once: yes
+          set_fact:
+            afterBytes: "{{after_usedBytes.results[0].stdout|int}}"
+
+        - name: Set changedBytes
+          run_once: yes
+          set_fact:
+            changedBytes: "{{afterBytes|int - beforeBytes|int}}"
+
+        - name: check changedBytes
+          run_once: yes
+          debug: var=changedBytes
+
+        - name: Set Update Policy
+          run_once: yes
+          set_fact:
+                updatePolicy: "{{(changedBytes|int > CommitPolicy.MinimumChangedBytes|int) or CommitPolicy.Force}}"
+
+        - name: check Update Policy
+          run_once: yes
+          debug: var=updatePolicy|bool
+
+        - name: Updating Image Based on Update Policy
+          when: updatePolicy|bool
+          block:
+                - name: "Updating Container Images :: Create Container Image Commit"
+                  delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+                  run_once: yes
+                  loop: "{{Docker.Containers}}"
+                  command: "docker commit centos {{item.image}}:latest"
+
+                - name: "Updating Container Images :: Create Container Image Tarballs"
+                  delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+                  run_once: yes
+                  loop: "{{Docker.Containers}}"
+                  docker_image:
+                     name: "{{item.image}}:latest"
+                     archive_path: "{{ImageStorageDirectory}}/docker-images/{{Docker.Images[item.imageTarball].archive}}"
+                     push: no
+                     repository: "{{item.image}}"
+
+                - name: "Updating Container Images :: Fetch Container Image Tarballs"
+                  delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+                  run_once: yes
+                  loop: "{{Docker.Containers}}"
+                  fetch:
+                    validate_checksum: no
+                    src: "{{ImageStorageDirectory}}/docker-images/{{Docker.Images[item.imageTarball].archive}}"
+                    dest: ../dockerImages/docker-images
+                    flat: yes
+
+                - name: "Updating Container Images :: Push Docker Image Tarballs to Repo"
+                  when: Blocks.Commit
+                  delegate_to: localhost
+                  run_once: yes
+                  loop: "{{Docker.Containers}}"
+                  shell: "git add {{Docker.Images[item.imageTarball].archive}}; git commit {{Docker.Images[item.imageTarball].archive}} -m 'automatic docker image update from playbook' && git status | grep 'directory clean' || git push"
+                  args:
+                    chdir: ../dockerImages/docker-images 
+        
+
+           
+  - name: Create Docker Containers
+    tags: containers
+    when: Blocks.Containers
+    block:
+        - name: Create Test CentOS 7 Container
+          loop: "{{Docker.Containers}}"
+          register: testContainer
+          docker_container:
+              pull: no
+              auto_remove: no
+              cleanup: no
+              detach: yes
+              name: "{{item.name}}"
+              image: "{{item.image}}"
+              state: "{{item.state}}"
+              volumes: "{{item.volumes}}"
+              privileged: "{{item.privileged}}"
+              capabilities: "{{item.capabilities}}"
+              hostname: "{{item.hostname}}"
+              recreate: yes
+              memory: 512M
+              memory_swap: 1024M
+              memory_reservation: 512M
+              ports:
+               - "35992:9000"
+               - "127.0.0.1:35993:9001/udp"
+        - name: Debug testContainer
+          debug: var=testContainer
