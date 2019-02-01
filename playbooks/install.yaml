@@ -2,121 +2,17 @@
 - name: Setup VPN Client Node
   hosts: vpnClientNodes
   gather_facts: yes
+  vars_files:
+    - ../vars/localVariables.yaml
   vars:
     Blocks:
-        Setup: no
-        Synchronize: no
-        Containers: no
+        Setup: yes
+        FirewallConfiguration: yes
+        SynchronizeImages: no
         UpdateImages: yes
-        Commit: no
-    ImageStorageDirectory: /root/dockerImages
-    CommitPolicy:
-        MinimumChangedBytes: 100000
-        Force: yes
-    Docker:
-        API:
-          Host: 0.0.0.0
-          Port: 19223
-          Socket: /var/run/docker.sock
-        ImageTemplateServer: vpn201
-        Containers:
-          - name: centos
-            imageTemplate: yes
-            image: centos/systemd
-            imageTarball: centos-systemd
-            state: started
-            hostname: centos-7-test
-            privileged: yes
-            volumes:
-                - /sys/fs/cgroup:/sys/fs/cgroup:ro
-                - /dev/net:/dev/net:z
-                - /srv/service1:/var/lib/service1:Z
-            capabilities:
-               - net_admin
-            ports:
-               - "127.0.0.1:39552:22/tcp"
-               - "127.0.0.1:35993:9001/udp"
-            Commands:
-                _Update: yum -y update
-                _Install: yum -y install
-                _Pip_Install: pip install --user --upgrade --force
-                _Npm_Install: npm i -g
-                _Remove: yum -y remove
-                _UsedBytes: "df / | tail -n1 | tr -s ' ' | cut -d' ' -f3"
-            Npms:
-                Present:
-                  - speed-test
-                  - xterm
-                  - js-beautify
-                  - nodemon
-                  - async
-                  - n
-            Pips:
-                Present:
-                  - speedtest-cli
-                  - tcconfig
-            Packages:
-                Update:
-                  - '*'
-                Present:
-                  - epel-release
-                  - nmap
-                  - httpd
-                  - strace
-                  - htop
-                  - nagios-plugins-ifstatus
-                  - unzip
-                  - autoconf
-                  - psmisc
-                  - curl-devel
-                  - iproute
-                  - iperf
-                  - lsof
-                  - tmux
-                  - iptraf-ng
-                  - unbound-libs
-                  - python-pip
-                  - yum-utils
-                  - zsh
-                  - socat
-                  - ppp
-                  - openconnect
-                  - vim-enhanced
-                  - xl2tpd
-                  - expect
-                  - mlocate
-                  - autoconf
-                  - libpcap
-                  - fping
-                  - ngrep
-                  - wget
-                  - curl
-                  - telnet
-                  - nload
-                  - openssl
-                  - net-tools
-                  - git
-                  - rsync
-                  - md5
-                  - python
-                  - tcpdump
-                  - openvpn
-                  - gcc
-                  - nmap-ncat
-                  - bind-utils
-                  - iostat
-
-
-                Absent:
-                  - adcli
-        Images:
-          centos-systemd:
-            archive: centos-systemd.tar
-            build: yes
-            update: yes
-            templateServer: vpn201
-            Commit: no
-
+        FetchImages: no
+        CommitImages: no
+        Containers: yes
 
   handlers:
   - name: Restart SSHD
@@ -138,8 +34,9 @@
           become: yes
           become_method: sudo
           become_user: root
-          command: yum -y install docker
-          #warn: no
+          command: "yum -y install {{Docker.Packages|join(' ')}}"
+          args:
+            warn: no
         - name: Installing Docker Python Packages
           loop: [docker]
           pip: name={{item}} state=present
@@ -151,7 +48,8 @@
           become_method: sudo
           become_user: root
           command: pip install docker --user
-          #warn: no
+          args:
+            warn: no
         - name: Starting and Enabling Docker
           service: name=docker state=started enabled=yes
         - name: Configuring Docker to listen on TCP
@@ -163,30 +61,64 @@
         - name: restart docker
           when: dr is changed
           systemd: name=docker state=restarted
-
-  - name: Synchronize vpntech-docker-images Tarballs
-    tags: images
-    when: Blocks.Synchronize
+        
+  - name: Configure Docker Server Firewalls
+    tags: FirewallConfiguation
+    when: Blocks.FirewallConfiguration
     block:
-        - name: "Create Remote {{ImageStorageDirectory}}/vpntech-docker-images directory"
-          file: path={{ImageStorageDirectory}}/vpntech-docker-images state=directory
+        - name: Check if CSF is installed
+          register: csfPost
+          stat: path=/etc/csf/csfpost.sh
+        - name: Checking if CSFPOSTD_PATH is in csfpost.sh
+          when: csfPost.stat.exists
+          command: grep CSFPOSTD_PATH /etc/csf/csfpost.sh
+          ignore_errors: yes
+          register: csfPostdPath
+        - name: Adding CSFPOSTD_PATH Include Logic to csfpost.sh
+          register: csfPostScript
+          when: 
+            - csfPost.stat.exists
+            - csfPostdPath.rc != 0
+          blockinfile:
+            path: /etc/csf/csfpost.sh
+            state: present
+            validate: bash -n %s
+            block: "{{lookup('file', 'csfPostInclude.sh')}}"
+            backup: yes
+            insertafter: EOF
+        - name: Copying docker.sh csf script
+          copy: src=docker.sh dest=/usr/local/include/csf/post.d/docker.sh mode=0700
+          register: csfScript
+        - name: Restarting CSF
+          when: csfPostScript is changed or csfScript is changed
+          service: name=csf state=restarted
+        - name: Checking CSF List
+          when: csfPostScript is changed or csfScript is changed
+          command: csf -l
+
+  - name: "Synchronize {{Repos.DockerImages}} Tarballs"
+    tags: images
+    when: Blocks.SynchronizeImages
+    block:
+        - name: "Create Remote {{ImageStorageDirectory}}/{{Repos.DockerImages}} directory"
+          file: path={{ImageStorageDirectory}}/{{Repos.DockerImages}} state=directory
         - name: debug files
           loop: "{{Docker.Images.keys()}}"
           debug: var=Docker.Images[item].archive
         - name: debug src files
           loop: "{{Docker.Images.keys()}}"
           debug:
-            msg: "../dockerImages/vpntech-docker-images/{{Docker.Images[item].archive}}"
+            msg: "../dockerImages/{{Repos.DockerImages}}/{{Docker.Images[item].archive}}"
         - name: debug dest files
           loop: "{{Docker.Images.keys()}}"
           debug:
-            msg: "{{ImageStorageDirectory}}/vpntech-docker-images/{{Docker.Images[item].archive}}"
+            msg: "{{ImageStorageDirectory}}/{{Repos.DockerImages}}/{{Docker.Images[item].archive}}"
         - name: Copy Image Tarballs
           loop: "{{Docker.Images.keys()}}"
           register: copiedTarballs
           copy: 
-            src: "../dockerImages/vpntech-docker-images/{{Docker.Images[item].archive}}" 
-            dest: "{{ImageStorageDirectory}}/vpntech-docker-images/"
+            src: "../dockerImages/{{Repos.DockerImages}}/{{Docker.Images[item].archive}}" 
+            dest: "{{ImageStorageDirectory}}/{{Repos.DockerImages}}/"
         - name: Import Docker Images
           loop: "{{Docker.Images.keys()}}"
           register: imageImports
@@ -194,7 +126,7 @@
           - Docker.Images[item].build
           docker_image:
              name: "{{item}}"
-             load_path: "{{ImageStorageDirectory}}/vpntech-docker-images/{{Docker.Images[item].archive}}"
+             load_path: "{{ImageStorageDirectory}}/{{Repos.DockerImages}}/{{Docker.Images[item].archive}}"
              push: no
              buildargs:
                log_volume: /var/log/myapp
@@ -208,7 +140,7 @@
     when: Blocks.UpdateImages
     block:
         - name: "Updating Container Images :: Remove Image Containers"
-          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          delegate_to: "{{ImageTemplateServer}}"
           run_once: yes
           loop: "{{Docker.Containers}}"
           docker_container:
@@ -217,7 +149,7 @@
             purge_networks: yes
 
         - name: "Updating Container Images :: Create CentOS Container Images"
-          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          delegate_to: "{{ImageTemplateServer}}"
           run_once: yes
           loop: "{{Docker.Containers}}"
           docker_container:
@@ -235,13 +167,13 @@
             cleanup: no
 
         - name: "Updating Container Images :: Pausing to let Containers start"
-          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          delegate_to: "{{ImageTemplateServer}}"
           loop: "{{Docker.Containers}}"
           run_once: yes
           pause: seconds=2
 
         - name: "Updating Container Images :: Collecting Container Used Bytes"
-          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          delegate_to: "{{ImageTemplateServer}}"
           run_once: yes
           loop: "{{Docker.Containers}}"
           register: before_usedBytes
@@ -253,16 +185,12 @@
             beforeBytes: "{{before_usedBytes.results[0].stdout|int}}"
 
         - name: Add the newly created container to the inventory
-#          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
           loop: "{{Docker.Containers}}"
           add_host:
               name: "{{ item.name }}"
               ansible_connection: docker
               ansible_user: root
-              ansible_docker_extra_args: "-H=tcp://{{Docker.Images[item.imageTarball].templateServer}}:{{Docker.API.Port}}"
-              #remote_addr: "{{item.name}}"
-              #ansible_ssh_host: "{{Docker.Images[item.imageTarball].templateServer}}"
-              #ansible_python_interpreter: /usr/bin/python
+              ansible_docker_extra_args: "-H=tcp://{{ImageTemplateServer}}:{{Docker.API.Port}}"
 
         - name: Gather Docker Container Facts
           run_once: yes
@@ -278,25 +206,67 @@
           debug: var=hostvars['centos']
           run_once: yes
 
-        - name: Run test command in Docker Container
+        #- name: Run test command in Docker Container
+        #  when: no
+        #  run_once: yes
+        #  delegate_to: centos
+        #  command: ifconfig
+        #  register: i
+        #- debug: var=i
+
+#        - name: "Updating Container Images :: Ensuring Container is started"
+#          delegate_to: "{{ImageTemplateServer}}"
+#          run_once: yes
+#          loop: "{{Docker.Containers}}"
+
+        - name: "Updating Container Images :: Verifying the Docker container can reach the internet"
+          delegate_to: "{{ImageTemplateServer}}"
           run_once: yes
-          delegate_to: centos
-          command: ifconfig
-          register: i
+          loop: "{{Docker.Containers}}"
+          register: pingTest
+          shell: "docker exec {{item.name}} bash -l -c \"ping -w 1 -c 1 4.2.2.1\""
+          ignore_errors: yes
 
-        - debug: var=i
+        - name: "Updating Container Images :: Restarting Docker"
+          when: pingTest is failed
+          delegate_to: "{{ImageTemplateServer}}"
+          run_once: yes
+          loop: "{{Docker.Containers}}"
+          systemd: name=docker state=restarted
 
-        - meta: end_play
-
-        - name: "Updating Container Images :: Issue Container Image Update Commands"
-          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+        - name: "Updating Container Images :: Verifying the Docker container can reach the internet"
+          when: pingTest is failed
+          delegate_to: "{{ImageTemplateServer}}"
           run_once: yes
           loop: "{{Docker.Containers}}"
           register: updateOutput
-          shell: "docker exec {{item.name}} bash -l -c \"{{item.Commands._Update}} {{item.Packages.Update|join(' ')}} && {{item.Commands._Install}} {{item.Packages.Present|join(' ')}} && {{item.Commands._Remove}} {{item.Packages.Absent|join(' ')}} && {{item.Commands._Pip_Install}} {{item.Pips.Present|join(' ')}} && {{item.Commands._Npm_Install}} {{item.Npms.Present|join(' ')}}\""
+          shell: "docker exec {{item.name}} bash -l -c \"ping -w 1 -c 1 4.2.2.1\""
+
+        - name: Install the remi and ius repo from remote repo
+          run_once: yes
+          delegate_to: centos
+          yum:
+            name:
+             - "https://rpms.remirepo.net/enterprise/remi-release-{{ ansible_distribution_major_version }}.rpm"
+             - "https://centos{{ ansible_distribution_major_version }}.iuscommunity.org/ius-release.rpm"
+
+        - name: Updating Packages in Docker Container
+          run_once: yes
+          delegate_to: "{{item.name}}"
+          loop: "{{Docker.Containers}}"
+          yum: name={{item.Packages.Update}} state=latest
+
+#        - meta: end_play
+
+        - name: "Updating Container Images :: Issue Container Image Update Commands"
+          delegate_to: "{{ImageTemplateServer}}"
+          run_once: yes
+          loop: "{{Docker.Containers}}"
+          register: updateOutput
+          shell: "docker exec {{item.name}} bash -l -c \"{{item.Commands._Remove}} {{item.Packages.Absent|join(' ')}} && {{item.Commands._Update}} {{item.Packages.Update|join(' ')}} && {{item.Commands._Install}} {{item.Packages.Present|join(' ')}} && {{item.Commands._Pip_Install}} {{item.Pips.Present|join(' ')}} && {{item.Commands._Npm_Install}} {{item.Npms.Present|join(' ')}}\""
 
         - name: "Updating Container Images :: Collecting Container Used Bytes"
-          delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+          delegate_to: "{{ImageTemplateServer}}"
           run_once: yes
           loop: "{{Docker.Containers}}"
           register: after_usedBytes
@@ -329,39 +299,40 @@
           when: updatePolicy|bool
           block:
                 - name: "Updating Container Images :: Create Container Image Commit"
-                  delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+                  delegate_to: "{{ImageTemplateServer}}"
                   run_once: yes
                   loop: "{{Docker.Containers}}"
                   command: "docker commit centos {{item.image}}:latest"
 
                 - name: "Updating Container Images :: Create Container Image Tarballs"
-                  delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+                  delegate_to: "{{ImageTemplateServer}}"
                   run_once: yes
                   loop: "{{Docker.Containers}}"
                   docker_image:
                      name: "{{item.image}}:latest"
-                     archive_path: "{{ImageStorageDirectory}}/vpntech-docker-images/{{Docker.Images[item.imageTarball].archive}}"
+                     archive_path: "{{ImageStorageDirectory}}/{{Repos.DockerImages}}/{{Docker.Images[item.imageTarball].archive}}"
                      push: no
                      repository: "{{item.image}}"
 
                 - name: "Updating Container Images :: Fetch Container Image Tarballs"
-                  delegate_to: "{{Docker.Images[item.imageTarball].templateServer}}"
+                  when: Blocks.FetchImages
+                  delegate_to: "{{ImageTemplateServer}}"
                   run_once: yes
                   loop: "{{Docker.Containers}}"
                   fetch:
                     validate_checksum: no
-                    src: "{{ImageStorageDirectory}}/vpntech-docker-images/{{Docker.Images[item.imageTarball].archive}}"
-                    dest: ../dockerImages/vpntech-docker-images
+                    src: "{{ImageStorageDirectory}}/{{Repos.DockerImages}}/{{Docker.Images[item.imageTarball].archive}}"
+                    dest: "../dockerImages/{{Repos.DockerImages}}"
                     flat: yes
 
                 - name: "Updating Container Images :: Push Docker Image Tarballs to Repo"
-                  when: Blocks.Commit
+                  when: Blocks.CommitImages
                   delegate_to: localhost
                   run_once: yes
                   loop: "{{Docker.Containers}}"
                   shell: "git add {{Docker.Images[item.imageTarball].archive}}; git commit {{Docker.Images[item.imageTarball].archive}} -m 'automatic docker image update from playbook' && git status | grep 'directory clean' || git push"
                   args:
-                    chdir: ../dockerImages/vpntech-docker-images 
+                    chdir: "../dockerImages/{{Repos.DockerImages}}"
         
 
            
